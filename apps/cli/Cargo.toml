@@ -1,0 +1,18 @@
+# File: apps/cli/Cargo.toml
+[package]
+name = "hyperfind-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "hyperfind-cli"
+path = "src/main.rs"
+
+[dependencies]
+hyperfind-common = { path = "../../crates/common" }
+hyperfind-core-engine = { path = "../../crates/core-engine" }
+clap = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

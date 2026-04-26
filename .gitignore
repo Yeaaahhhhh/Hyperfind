@@ -1,0 +1,37 @@
+# File: .gitignore
+# Rust
+/target/
+**/target/
+Cargo.lock
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Build artifacts
+build/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# HyperFind runtime data
+hyperfind_data/
+*.log
+
+# Environment
+.env
+.env.local

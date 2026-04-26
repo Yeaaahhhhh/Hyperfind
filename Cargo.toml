@@ -1,0 +1,43 @@
+# File: Cargo.toml
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/index-engine",
+    "crates/collector",
+    "crates/core-engine",
+    "crates/platform-windows",
+    "crates/platform-macos",
+    "crates/platform-linux",
+    "crates/plugin-api",
+    "crates/benchmark-suite",
+    "apps/cli",
+    "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["HyperFind Contributors"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+parking_lot = "0.12"
+tokio = { version = "1", features = ["full"] }
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+notify = "6"
+walkdir = "2"
+uuid = { version = "1", features = ["v4"] }
+memmap2 = "0.9"
+byteorder = "1"
+crc32fast = "1"
+libloading = "0.8"

@@ -1,0 +1,12 @@
+# File: crates/plugin-api/Cargo.toml
+[package]
+name = "hyperfind-plugin-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hyperfind-common = { path = "../common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libloading = { workspace = true }
+tracing = { workspace = true }

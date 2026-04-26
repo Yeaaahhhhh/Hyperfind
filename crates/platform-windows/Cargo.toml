@@ -1,0 +1,20 @@
+# File: crates/platform-windows/Cargo.toml
+[package]
+name = "hyperfind-platform-windows"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hyperfind-common = { path = "../common" }
+hyperfind-index-engine = { path = "../index-engine" }
+tracing = { workspace = true }
+chrono = { workspace = true }
+rayon = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_Foundation",
+    "Win32_System_Ioctl",
+] }

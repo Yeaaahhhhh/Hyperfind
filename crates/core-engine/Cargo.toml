@@ -1,0 +1,17 @@
+# File: crates/core-engine/Cargo.toml
+[package]
+name = "hyperfind-core-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hyperfind-common = { path = "../common" }
+hyperfind-index-engine = { path = "../index-engine" }
+hyperfind-collector = { path = "../collector" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+rayon = { workspace = true }

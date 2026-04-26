@@ -1,0 +1,9 @@
+# File: crates/platform-macos/Cargo.toml
+[package]
+name = "hyperfind-platform-macos"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hyperfind-common = { path = "../common" }
+tracing = { workspace = true }

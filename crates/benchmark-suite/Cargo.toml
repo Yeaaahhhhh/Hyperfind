@@ -1,0 +1,16 @@
+# File: crates/benchmark-suite/Cargo.toml
+[package]
+name = "hyperfind-benchmark-suite"
+version.workspace = true
+edition.workspace = true
+
+[dev-dependencies]
+hyperfind-common = { path = "../common" }
+hyperfind-core-engine = { path = "../core-engine" }
+hyperfind-index-engine = { path = "../index-engine" }
+criterion = { version = "0.5", features = ["html_reports"] }
+chrono = { workspace = true }
+
+[[bench]]
+name = "basic_search"
+harness = false
