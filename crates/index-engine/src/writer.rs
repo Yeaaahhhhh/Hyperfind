@@ -10,7 +10,6 @@ use hyperfind_common::paths;
 use tracing::info;
 use uuid::Uuid;
 
-/// Writes the full index to disk as a segment-based binary format.
 pub fn write_index(
     documents: &[FileDocument],
     trigram_index: &TrigramIndex,
@@ -19,16 +18,12 @@ pub fn write_index(
     let index_dir = paths::index_dir()?;
     std::fs::create_dir_all(&index_dir)?;
 
-    // Delete old segments
     segment::delete_all_segments()?;
     std::fs::create_dir_all(paths::segments_dir()?)?;
 
-    // Write as a single segment for now
-    // Future: split into multiple segments based on size
     let segment_id = Uuid::new_v4().to_string();
     segment::write_segment(&segment_id, documents, trigram_index, bitmap_index)?;
 
-    // Write commit point
     let commit = CommitPoint {
         generation: 1,
         segments: vec![segment_id],
@@ -36,45 +31,34 @@ pub fn write_index(
     };
     segment::write_commit(&commit)?;
 
-    // Write metadata
     let meta = IndexMeta::new(
         documents.len() as u64,
         document::current_id_counter(),
         1,
         trigram_index.trigram_count(),
     );
-    let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| {
-        HyperFindError::SerializationError(format!("Failed to serialize meta: {}", e))
-    })?;
+    let meta_json = serde_json::to_string_pretty(&meta)
+        .map_err(|e| HyperFindError::SerializationError(format!("meta serialize: {}", e)))?;
     std::fs::write(index_dir.join("meta.json"), meta_json)?;
 
-    info!("Index written: {} documents in segment format", documents.len());
+    info!("Index written: {} docs (segment v2 / bincode / mmap-ready)", documents.len());
     Ok(())
 }
 
-/// Returns true if an index exists on disk.
 pub fn index_exists() -> Result<bool, HyperFindError> {
     let index_dir = paths::index_dir()?;
-    let meta_path = index_dir.join("meta.json");
-    let commit_path = index_dir.join("commit.json");
-    Ok(meta_path.exists() && commit_path.exists())
+    Ok(index_dir.join("meta.json").exists() && index_dir.join("commit.json").exists())
 }
 
-/// Deletes all index data.
 pub fn delete_index() -> Result<(), HyperFindError> {
     let index_dir = paths::index_dir()?;
-    if index_dir.exists() {
-        std::fs::remove_dir_all(&index_dir)?;
-    }
+    if index_dir.exists() { std::fs::remove_dir_all(&index_dir)?; }
     Ok(())
 }
 
-/// Returns the total size of all index files in bytes.
 pub fn index_size_bytes() -> Result<u64, HyperFindError> {
     let index_dir = paths::index_dir()?;
-    if !index_dir.exists() {
-        return Ok(0);
-    }
+    if !index_dir.exists() { return Ok(0); }
     let mut total = 0u64;
     for entry in walkdir::WalkDir::new(&index_dir) {
         if let Ok(e) = entry {

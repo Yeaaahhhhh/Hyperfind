@@ -1,205 +1,240 @@
 // File: crates/index-engine/src/trigram.rs
 
-//! Trigram-based inverted index for sub-linear file name search.
+//! Trigram inverted index (优化版).
 //!
-//! Instead of scanning all N documents for every query, we:
-//! 1. Generate trigrams from file names at index time.
-//! 2. Build posting lists: trigram -> [doc_id, doc_id, ...]
-//! 3. At query time, generate trigrams from the query and intersect posting lists.
-//! 4. Only score the candidate documents, which is typically << N.
+//! 关键改动：
+//! - 提供 `query_bitmap()`，搜索阶段直接返回 `RoaringTreemap`，避免 `Vec<u64> -> RoaringTreemap` 二次构造
+//! - `build()` 改为分片并行局部聚合再 merge，避免 `Vec<(u64, Vec<u32>)>` 这种超大中间结构
+//! - 预分配与合并路径优化，降低 build 峰值内存
+//! - 保留旧 `query()` / `query_into()` 兼容 API，但内部复用位图查询
 
-use hyperfind_common::utils::generate_trigrams;
+use hyperfind_common::utils::trigram_codes;
 use parking_lot::RwLock;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use roaring::RoaringTreemap;
+use rustc_hash::FxHashMap;
 use tracing::info;
 
-/// A posting list: sorted list of document IDs that contain a particular trigram.
-pub type PostingList = Vec<u64>;
-
-/// The trigram inverted index.
 pub struct TrigramIndex {
-    /// Maps trigram string to a sorted list of document IDs.
-    postings: RwLock<HashMap<String, PostingList>>,
+    postings: RwLock<FxHashMap<u32, RoaringTreemap>>,
 }
 
 impl TrigramIndex {
     pub fn new() -> Self {
         Self {
-            postings: RwLock::new(HashMap::new()),
+            postings: RwLock::new(FxHashMap::default()),
         }
     }
 
-    /// Builds the trigram index from a list of (doc_id, name) pairs.
-    /// Uses rayon for parallel trigram generation.
+    /// 分片并行构建：
+    /// - 每个分片在线程内局部聚合 trigram -> roaring
+    /// - 最后 merge 到全局 map
+    /// 这样比先构造 `Vec<(u64, Vec<u32>)>` 更省内存。
     pub fn build(&self, docs: &[(u64, &str)]) {
-        // Parallel: generate trigrams for each doc
-        let all_trigrams: Vec<(u64, Vec<String>)> = docs
-            .par_iter()
-            .map(|(id, name)| (*id, generate_trigrams(name)))
+        if docs.is_empty() {
+            self.postings.write().clear();
+            return;
+        }
+
+        let threads = rayon::current_num_threads().max(1);
+        let chunk_size = (docs.len() / threads).max(8_192);
+
+        let partials: Vec<FxHashMap<u32, RoaringTreemap>> = docs
+            .par_chunks(chunk_size)
+            .map(|chunk| {
+                let mut local: FxHashMap<u32, RoaringTreemap> = FxHashMap::default();
+
+                for &(doc_id, name) in chunk {
+                    let codes = trigram_codes(name);
+                    for code in codes {
+                        local
+                            .entry(code)
+                            .or_insert_with(RoaringTreemap::new)
+                            .insert(doc_id);
+                    }
+                }
+
+                local
+            })
             .collect();
 
-        // Single-threaded merge into the posting lists
-        let mut postings = HashMap::new();
-        for (doc_id, trigrams) in &all_trigrams {
-            for tri in trigrams {
-                postings
-                    .entry(tri.clone())
-                    .or_insert_with(Vec::new)
-                    .push(*doc_id);
+        let mut merged: FxHashMap<u32, RoaringTreemap> = FxHashMap::default();
+        let estimated = partials
+            .iter()
+            .map(|m| m.len())
+            .max()
+            .unwrap_or(0)
+            .saturating_mul(2);
+        merged.reserve(estimated);
+
+        for part in partials {
+            for (code, rt) in part {
+                match merged.get_mut(&code) {
+                    Some(existing) => {
+                        *existing |= rt;
+                    }
+                    None => {
+                        merged.insert(code, rt);
+                    }
+                }
             }
         }
 
-        // Sort each posting list for efficient intersection
-        for list in postings.values_mut() {
-            list.sort_unstable();
-            list.dedup();
-        }
-
-        let count = postings.len();
-        *self.postings.write() = postings;
-        info!("TrigramIndex built: {} unique trigrams", count);
+        let count = merged.len();
+        *self.postings.write() = merged;
+        info!("TrigramIndex built: {} unique trigrams (roaring)", count);
     }
 
-    /// Adds a single document to the index.
     pub fn add_document(&self, doc_id: u64, name: &str) {
-        let trigrams = generate_trigrams(name);
+        let codes = trigram_codes(name);
         let mut postings = self.postings.write();
-        for tri in trigrams {
-            let list = postings.entry(tri).or_insert_with(Vec::new);
-            // Insert sorted
-            if let Err(pos) = list.binary_search(&doc_id) {
-                list.insert(pos, doc_id);
-            }
+        for code in codes {
+            postings
+                .entry(code)
+                .or_insert_with(RoaringTreemap::new)
+                .insert(doc_id);
         }
     }
 
-    /// Removes a document from the index.
     pub fn remove_document(&self, doc_id: u64, name: &str) {
-        let trigrams = generate_trigrams(name);
+        let codes = trigram_codes(name);
         let mut postings = self.postings.write();
-        for tri in trigrams {
-            if let Some(list) = postings.get_mut(&tri) {
-                if let Ok(pos) = list.binary_search(&doc_id) {
-                    list.remove(pos);
+        for code in codes {
+            if let Some(rt) = postings.get_mut(&code) {
+                rt.remove(doc_id);
+                if rt.is_empty() {
+                    postings.remove(&code);
                 }
             }
         }
     }
 
-    /// Queries the trigram index for candidate document IDs.
-    /// Returns the intersection of posting lists for all query trigrams.
-    pub fn query(&self, keyword: &str) -> Vec<u64> {
-        let trigrams = generate_trigrams(keyword);
-        if trigrams.is_empty() {
-            return Vec::new();
+    /// 直接返回位图结果，供搜索链路直接做位图交集。
+    pub fn query_bitmap(&self, keyword: &str) -> Option<RoaringTreemap> {
+        let codes = trigram_codes(keyword);
+        if codes.is_empty() {
+            return None;
         }
 
         let postings = self.postings.read();
 
-        let mut lists: Vec<&PostingList> = Vec::new();
-        for tri in &trigrams {
-            if let Some(list) = postings.get(tri) {
-                lists.push(list);
-            } else {
-                // If any trigram has no posting list, intersection is empty
-                return Vec::new();
+        let mut lists: Vec<&RoaringTreemap> = Vec::with_capacity(codes.len());
+        for code in &codes {
+            match postings.get(code) {
+                Some(list) => lists.push(list),
+                None => return Some(RoaringTreemap::new()),
             }
         }
 
-        if lists.is_empty() {
-            return Vec::new();
-        }
-
-        // Sort by smallest list first for efficient intersection
         lists.sort_by_key(|l| l.len());
 
-        let mut result = lists[0].clone();
+        let mut acc = lists[0].clone();
         for list in &lists[1..] {
-            result = intersect_sorted(&result, list);
-            if result.is_empty() {
+            acc &= *list;
+            if acc.is_empty() {
                 break;
             }
         }
 
-        result
+        Some(acc)
     }
 
-    /// Returns the total number of unique trigrams.
+    /// 兼容旧 API。
+    pub fn query(&self, keyword: &str) -> Vec<u64> {
+        match self.query_bitmap(keyword) {
+            Some(rt) => rt.into_iter().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// 兼容旧 API，避免调用方二次分配。
+    pub fn query_into(&self, keyword: &str, out: &mut Vec<u64>) {
+        out.clear();
+        if let Some(rt) = self.query_bitmap(keyword) {
+            out.reserve(rt.len() as usize);
+            for v in rt {
+                out.push(v);
+            }
+        }
+    }
+
     pub fn trigram_count(&self) -> u64 {
         self.postings.read().len() as u64
     }
 
-    /// Clears the entire trigram index.
     pub fn clear(&self) {
         self.postings.write().clear();
     }
 
-    /// Serializes the trigram index to bytes for segment storage.
+    /// 二进制序列化：
+    /// [count: u32]
+    /// 每条: [trigram_code: u32] [roaring_len: u32] [roaring bytes...]
     pub fn serialize(&self) -> Vec<u8> {
         let postings = self.postings.read();
-        // Format: [count: u32] [for each: [trigram_len: u16] [trigram_bytes] [posting_count: u32] [doc_ids: u64...]]
-        let mut buf = Vec::new();
-        let count = postings.len() as u32;
-        buf.extend_from_slice(&count.to_le_bytes());
+        let mut buf = Vec::with_capacity(postings.len() * 32);
+        buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
 
-        for (trigram, list) in postings.iter() {
-            let tri_bytes = trigram.as_bytes();
-            buf.extend_from_slice(&(tri_bytes.len() as u16).to_le_bytes());
-            buf.extend_from_slice(tri_bytes);
-            buf.extend_from_slice(&(list.len() as u32).to_le_bytes());
-            for &doc_id in list {
-                buf.extend_from_slice(&doc_id.to_le_bytes());
-            }
+        let mut tmp = Vec::with_capacity(4096);
+        for (code, rt) in postings.iter() {
+            tmp.clear();
+            rt.serialize_into(&mut tmp).expect("roaring serialize");
+            buf.extend_from_slice(&code.to_le_bytes());
+            buf.extend_from_slice(&(tmp.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&tmp);
         }
 
         buf
     }
 
-    /// Deserializes the trigram index from bytes.
     pub fn deserialize(&self, data: &[u8]) {
-        let mut pos = 0;
         if data.len() < 4 {
+            self.postings.write().clear();
             return;
         }
 
-        let count = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let mut pos = 0usize;
+        let count = u32::from_le_bytes([
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+        ]) as usize;
         pos += 4;
 
-        let mut postings = HashMap::with_capacity(count);
+        let mut postings: FxHashMap<u32, RoaringTreemap> =
+            FxHashMap::with_capacity_and_hasher(count, Default::default());
 
         for _ in 0..count {
-            if pos + 2 > data.len() {
+            if pos + 8 > data.len() {
                 break;
             }
-            let tri_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
 
-            if pos + tri_len > data.len() {
-                break;
-            }
-            let trigram = String::from_utf8_lossy(&data[pos..pos + tri_len]).to_string();
-            pos += tri_len;
-
-            if pos + 4 > data.len() {
-                break;
-            }
-            let list_count = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+            let code = u32::from_le_bytes([
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+            ]);
             pos += 4;
 
-            let mut list = Vec::with_capacity(list_count);
-            for _ in 0..list_count {
-                if pos + 8 > data.len() {
-                    break;
-                }
-                let doc_id = u64::from_le_bytes([
-                    data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                    data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
-                ]);
-                pos += 8;
-                list.push(doc_id);
+            let rlen = u32::from_le_bytes([
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+            ]) as usize;
+            pos += 4;
+
+            if pos + rlen > data.len() {
+                break;
             }
-            postings.insert(trigram, list);
+
+            let mut slice = &data[pos..pos + rlen];
+            pos += rlen;
+
+            if let Ok(rt) = RoaringTreemap::deserialize_from(&mut slice) {
+                postings.insert(code, rt);
+            }
         }
 
         *self.postings.write() = postings;
@@ -212,24 +247,6 @@ impl Default for TrigramIndex {
     }
 }
 
-/// Intersects two sorted slices efficiently.
-fn intersect_sorted(a: &[u64], b: &[u64]) -> Vec<u64> {
-    let mut result = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => {
-                result.push(a[i]);
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,27 +255,37 @@ mod tests {
     fn test_build_and_query() {
         let idx = TrigramIndex::new();
         let docs = vec![
-            (1, "main.rs"),
+            (1u64, "main.rs"),
             (2, "main.py"),
             (3, "lib.rs"),
             (4, "maintenance.log"),
         ];
-        let refs: Vec<(u64, &str)> = docs.iter().map(|(id, name)| (*id, *name)).collect();
+        let refs: Vec<(u64, &str)> = docs.iter().map(|(id, n)| (*id, *n)).collect();
         idx.build(&refs);
 
-        // "main" should match docs containing "mai", "ain"
-        let candidates = idx.query("main");
-        assert!(candidates.contains(&1));
-        assert!(candidates.contains(&2));
-        assert!(candidates.contains(&4));
-        assert!(!candidates.contains(&3));
+        let r = idx.query("main");
+        assert!(r.contains(&1));
+        assert!(r.contains(&2));
+        assert!(r.contains(&4));
+        assert!(!r.contains(&3));
     }
 
     #[test]
-    fn test_serialize_deserialize() {
+    fn test_query_bitmap() {
         let idx = TrigramIndex::new();
-        let docs = vec![(1, "hello"), (2, "help"), (3, "world")];
-        let refs: Vec<(u64, &str)> = docs.iter().map(|(id, name)| (*id, *name)).collect();
+        let refs: Vec<(u64, &str)> = vec![(1, "hello"), (2, "help"), (3, "world")];
+        idx.build(&refs);
+
+        let r = idx.query_bitmap("hel").unwrap();
+        assert!(r.contains(1));
+        assert!(r.contains(2));
+        assert!(!r.contains(3));
+    }
+
+    #[test]
+    fn test_serialize_roundtrip() {
+        let idx = TrigramIndex::new();
+        let refs: Vec<(u64, &str)> = vec![(1, "hello"), (2, "help"), (3, "world")];
         idx.build(&refs);
 
         let data = idx.serialize();
@@ -266,14 +293,8 @@ mod tests {
         let idx2 = TrigramIndex::new();
         idx2.deserialize(&data);
 
-        let candidates = idx2.query("hel");
-        assert!(candidates.contains(&1));
-        assert!(candidates.contains(&2));
-    }
-
-    #[test]
-    fn test_intersect_sorted() {
-        assert_eq!(intersect_sorted(&[1, 3, 5, 7], &[2, 3, 5, 8]), vec![3, 5]);
-        assert_eq!(intersect_sorted(&[1, 2, 3], &[4, 5, 6]), Vec::<u64>::new());
+        let r = idx2.query("hel");
+        assert!(r.contains(&1));
+        assert!(r.contains(&2));
     }
 }

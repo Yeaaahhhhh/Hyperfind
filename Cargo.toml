@@ -22,7 +22,7 @@ license = "MIT"
 authors = ["HyperFind Contributors"]
 
 [workspace.dependencies]
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1"
 thiserror = "1"
 anyhow = "1"
@@ -41,3 +41,6 @@ memmap2 = "0.9"
 byteorder = "1"
 crc32fast = "1"
 libloading = "0.8"
+roaring = "0.10"
+rustc-hash = "2.0"
+bincode = "1.3"

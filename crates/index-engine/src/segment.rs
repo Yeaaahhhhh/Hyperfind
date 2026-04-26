@@ -1,44 +1,35 @@
 // File: crates/index-engine/src/segment.rs
 
-//! Segment-based binary index format.
+//! Segment 文件格式 v2（高性能版）。
 //!
-//! Each segment file contains:
-//! - Header (magic, version, doc_count)
-//! - Document store: serialized FileDocuments
-//! - Trigram index data
-//! - Bitmap index data
-//! - Footer with offsets and checksum
+//! Layout:
+//!   [magic: 4]
+//!   [version: 4]
+//!   [doc_count: 8]
+//!   [doc_data_len: 8] [doc_data: bincode]
+//!   [trigram_len: 8]  [trigram_data]
+//!   [bitmap_len: 8]   [bitmap_data]
+//!   [crc32: 4]
 //!
-//! Segments are immutable once written. Updates create new segments.
-//! A commit file references all active segments.
+//! 改进：
+//! - 文档使用 `bincode` 而非 `serde_json`：体积↓，编/解码速度↑
+//! - 用 `mmap2` 读 segment，避免一次性 `fs::read`
+//! - v2 增加更严格的边界检查，避免切片 panic
 
 use crate::bitmap::BitmapIndex;
 use crate::trigram::TrigramIndex;
 use hyperfind_common::errors::HyperFindError;
 use hyperfind_common::models::FileDocument;
 use hyperfind_common::paths;
+use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use tracing::info;
 
 const SEGMENT_MAGIC: &[u8; 4] = b"HFSG";
-const SEGMENT_VERSION: u32 = 1;
+const SEGMENT_VERSION: u32 = 2;
 
-/// Segment file layout offsets stored in the footer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SegmentFooter {
-    pub doc_store_offset: u64,
-    pub doc_store_len: u64,
-    pub trigram_offset: u64,
-    pub trigram_len: u64,
-    pub bitmap_offset: u64,
-    pub bitmap_len: u64,
-    pub doc_count: u64,
-    pub checksum: u32,
-}
-
-/// Writes a segment file to disk.
 pub fn write_segment(
     segment_id: &str,
     documents: &[FileDocument],
@@ -47,156 +38,180 @@ pub fn write_segment(
 ) -> Result<std::path::PathBuf, HyperFindError> {
     let segments_dir = paths::segments_dir()?;
     fs::create_dir_all(&segments_dir)?;
-
     let path = segments_dir.join(format!("{}.seg", segment_id));
 
-    // Serialize documents
-    let doc_data = serde_json::to_vec(documents).map_err(|e| {
-        HyperFindError::IndexError(format!("Failed to serialize documents: {}", e))
-    })?;
+    let doc_data = bincode::serialize(documents)
+        .map_err(|e| HyperFindError::IndexError(format!("bincode docs: {}", e)))?;
+    let tri_data = trigram_index.serialize();
+    let bmp_data = bitmap_index.serialize();
 
-    // Serialize trigram index
-    let trigram_data = trigram_index.serialize();
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&doc_data);
+    crc.update(&tri_data);
+    crc.update(&bmp_data);
+    let checksum = crc.finalize();
 
-    // Serialize bitmap index
-    let bitmap_data = bitmap_index.serialize();
-
-    // Build file
-    let mut file = fs::File::create(&path)?;
-
-    // Header
-    file.write_all(SEGMENT_MAGIC)?;
-    file.write_all(&SEGMENT_VERSION.to_le_bytes())?;
-
-    let doc_store_offset = 8u64; // after magic + version
-    file.write_all(&doc_data)?;
-
-    let trigram_offset = doc_store_offset + doc_data.len() as u64;
-    file.write_all(&trigram_data)?;
-
-    let bitmap_offset = trigram_offset + trigram_data.len() as u64;
-    file.write_all(&bitmap_data)?;
-
-    // Compute checksum over all data
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&doc_data);
-    hasher.update(&trigram_data);
-    hasher.update(&bitmap_data);
-    let checksum = hasher.finalize();
-
-    let footer = SegmentFooter {
-        doc_store_offset,
-        doc_store_len: doc_data.len() as u64,
-        trigram_offset,
-        trigram_len: trigram_data.len() as u64,
-        bitmap_offset,
-        bitmap_len: bitmap_data.len() as u64,
-        doc_count: documents.len() as u64,
-        checksum,
-    };
-
-    let footer_data = serde_json::to_vec(&footer).map_err(|e| {
-        HyperFindError::IndexError(format!("Failed to serialize footer: {}", e))
-    })?;
-
-    // Write footer length then footer
-    file.write_all(&(footer_data.len() as u32).to_le_bytes())?;
-    file.write_all(&footer_data)?;
-
-    file.flush()?;
+    let mut f = fs::File::create(&path)?;
+    f.write_all(SEGMENT_MAGIC)?;
+    f.write_all(&SEGMENT_VERSION.to_le_bytes())?;
+    f.write_all(&(documents.len() as u64).to_le_bytes())?;
+    f.write_all(&(doc_data.len() as u64).to_le_bytes())?;
+    f.write_all(&doc_data)?;
+    f.write_all(&(tri_data.len() as u64).to_le_bytes())?;
+    f.write_all(&tri_data)?;
+    f.write_all(&(bmp_data.len() as u64).to_le_bytes())?;
+    f.write_all(&bmp_data)?;
+    f.write_all(&checksum.to_le_bytes())?;
+    f.flush()?;
 
     info!(
-        "Segment written: {} ({} docs, {} bytes)",
+        "Segment v2 written: {} ({} docs, doc={}KB tri={}KB bmp={}KB)",
         segment_id,
         documents.len(),
-        doc_data.len() + trigram_data.len() + bitmap_data.len()
+        doc_data.len() / 1024,
+        tri_data.len() / 1024,
+        bmp_data.len() / 1024
     );
 
     Ok(path)
 }
 
-/// Reads a segment file and returns its components.
 pub fn read_segment(
     path: &std::path::Path,
 ) -> Result<(Vec<FileDocument>, Vec<u8>, Vec<u8>), HyperFindError> {
-    let data = fs::read(path)?;
+    let file = fs::File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let data: &[u8] = &mmap;
 
-    if data.len() < 8 {
-        return Err(HyperFindError::IndexError("Segment too small".into()));
+    if data.len() < 16 {
+        return Err(HyperFindError::IndexError("segment too small".into()));
     }
-
-    // Verify magic
     if &data[0..4] != SEGMENT_MAGIC {
-        return Err(HyperFindError::IndexError("Invalid segment magic".into()));
+        return Err(HyperFindError::IndexError("invalid magic".into()));
     }
 
-    // Read footer length from end
-    if data.len() < 12 {
-        return Err(HyperFindError::IndexError("Segment too small for footer".into()));
+    let version = read_u32_at(data, 4)?;
+
+    if version == 2 {
+        return read_segment_v2(data);
+    }
+    if version == 1 {
+        return read_segment_v1_compat(data);
     }
 
+    Err(HyperFindError::IndexError(format!(
+        "unknown segment version {}",
+        version
+    )))
+}
 
+fn read_segment_v2(data: &[u8]) -> Result<(Vec<FileDocument>, Vec<u8>, Vec<u8>), HyperFindError> {
+    let mut pos = 8usize;
+
+    let _doc_count = read_u64(data, &mut pos)?;
+    let doc_len = read_u64(data, &mut pos)? as usize;
+    let doc_data = read_slice(data, &mut pos, doc_len)?;
+
+    let tri_len = read_u64(data, &mut pos)? as usize;
+    let tri_data = read_slice(data, &mut pos, tri_len)?;
+
+    let bmp_len = read_u64(data, &mut pos)? as usize;
+    let bmp_data = read_slice(data, &mut pos, bmp_len)?;
+
+    let stored_crc = read_u32(data, &mut pos)?;
+
+    if pos != data.len() {
+        return Err(HyperFindError::IndexError(format!(
+            "segment trailing bytes detected: total={} parsed={}",
+            data.len(),
+            pos
+        )));
+    }
+
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(doc_data);
+    crc.update(tri_data);
+    crc.update(bmp_data);
+    let computed = crc.finalize();
+
+    if computed != stored_crc {
+        return Err(HyperFindError::IndexError(format!(
+            "checksum mismatch: stored={} computed={}",
+            stored_crc, computed
+        )));
+    }
+
+    let docs: Vec<FileDocument> = bincode::deserialize(doc_data)
+        .map_err(|e| HyperFindError::IndexError(format!("bincode docs decode: {}", e)))?;
+
+    Ok((docs, tri_data.to_vec(), bmp_data.to_vec()))
+}
+
+fn read_segment_v1_compat(
+    data: &[u8],
+) -> Result<(Vec<FileDocument>, Vec<u8>, Vec<u8>), HyperFindError> {
     let file_len = data.len();
-    // Try reading last 8KB as potential footer area
     let scan_start = if file_len > 8192 { file_len - 8192 } else { 8 };
 
-    // Find the footer_len: iterate from scan_start
-    for candidate_pos in scan_start..file_len.saturating_sub(4) {
+    for cand in scan_start..file_len.saturating_sub(4) {
         let footer_len = u32::from_le_bytes([
-            data[candidate_pos],
-            data[candidate_pos + 1],
-            data[candidate_pos + 2],
-            data[candidate_pos + 3],
+            data[cand],
+            data[cand + 1],
+            data[cand + 2],
+            data[cand + 3],
         ]) as usize;
 
-        if footer_len > 0
-            && footer_len < 4096
-            && candidate_pos + 4 + footer_len == file_len
-        {
-            let footer_bytes = &data[candidate_pos + 4..];
-            if let Ok(footer) = serde_json::from_slice::<SegmentFooter>(footer_bytes) {
-                // Verify checksum
-                let content_end = candidate_pos;
-                let all_content = &data[8..content_end];
+        if footer_len > 0 && footer_len < 4096 && cand + 4 + footer_len == file_len {
+            let footer_bytes = &data[cand + 4..];
 
-                let mut hasher = crc32fast::Hasher::new();
-                hasher.update(all_content);
-                let computed = hasher.finalize();
+            #[derive(Deserialize)]
+            struct OldFooter {
+                doc_store_offset: u64,
+                doc_store_len: u64,
+                trigram_offset: u64,
+                trigram_len: u64,
+                bitmap_offset: u64,
+                bitmap_len: u64,
+                doc_count: u64,
+                checksum: u32,
+            }
 
-                if computed != footer.checksum {
-                    return Err(HyperFindError::IndexError(format!(
-                        "Segment checksum mismatch: expected {}, got {}",
-                        footer.checksum, computed
-                    )));
+            if let Ok(footer) = serde_json::from_slice::<OldFooter>(footer_bytes) {
+                let _ = footer.doc_store_offset;
+                let _ = footer.trigram_offset;
+                let _ = footer.bitmap_offset;
+                let _ = footer.doc_count;
+                let _ = footer.checksum;
+
+                let base = 8usize;
+                let doc_end = base + footer.doc_store_len as usize;
+                let tri_end = doc_end + footer.trigram_len as usize;
+                let bmp_end = tri_end + footer.bitmap_len as usize;
+
+                if bmp_end > data.len() || base > doc_end || doc_end > tri_end || tri_end > bmp_end
+                {
+                    return Err(HyperFindError::IndexError(
+                        "v1 segment ranges out of bounds".into(),
+                    ));
                 }
 
-                // Extract sections
-                let base = 8usize;
-                let doc_start = 0usize;
-                let doc_end = footer.doc_store_len as usize;
-                let tri_start = doc_end;
-                let tri_end = tri_start + footer.trigram_len as usize;
-                let bmp_start = tri_end;
-                let bmp_end = bmp_start + footer.bitmap_len as usize;
+                let doc_slice = &data[base..doc_end];
+                let tri_slice = &data[doc_end..tri_end];
+                let bmp_slice = &data[tri_end..bmp_end];
 
-                let doc_slice = &data[base + doc_start..base + doc_end];
-                let tri_slice = &data[base + tri_start..base + tri_end];
-                let bmp_slice = &data[base + bmp_start..base + bmp_end];
+                let docs: Vec<FileDocument> = serde_json::from_slice(doc_slice)
+                    .map_err(|e| HyperFindError::IndexError(format!("v1 docs: {}", e)))?;
 
-                let documents: Vec<FileDocument> = serde_json::from_slice(doc_slice)
-                    .map_err(|e| {
-                        HyperFindError::IndexError(format!("Failed to parse documents: {}", e))
-                    })?;
-
-                return Ok((documents, tri_slice.to_vec(), bmp_slice.to_vec()));
+                return Ok((docs, tri_slice.to_vec(), bmp_slice.to_vec()));
             }
         }
     }
 
-    Err(HyperFindError::IndexError("Could not locate segment footer".into()))
+    Err(HyperFindError::IndexError(
+        "v1 segment footer not found".into(),
+    ))
 }
 
-/// The commit file: lists active segment IDs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitPoint {
     pub generation: u64,
@@ -204,18 +219,15 @@ pub struct CommitPoint {
     pub timestamp: String,
 }
 
-/// Writes the commit point.
 pub fn write_commit(commit: &CommitPoint) -> Result<(), HyperFindError> {
     let index_dir = paths::index_dir()?;
     let path = index_dir.join("commit.json");
-    let data = serde_json::to_string_pretty(commit).map_err(|e| {
-        HyperFindError::IndexError(format!("Failed to serialize commit: {}", e))
-    })?;
+    let data = serde_json::to_string_pretty(commit)
+        .map_err(|e| HyperFindError::IndexError(format!("commit serialize: {}", e)))?;
     fs::write(&path, data)?;
     Ok(())
 }
 
-/// Reads the commit point.
 pub fn read_commit() -> Result<Option<CommitPoint>, HyperFindError> {
     let index_dir = paths::index_dir()?;
     let path = index_dir.join("commit.json");
@@ -223,21 +235,82 @@ pub fn read_commit() -> Result<Option<CommitPoint>, HyperFindError> {
         return Ok(None);
     }
     let data = fs::read_to_string(&path)?;
-    let commit: CommitPoint = serde_json::from_str(&data).map_err(|e| {
-        HyperFindError::IndexError(format!("Failed to parse commit: {}", e))
-    })?;
+    let commit: CommitPoint = serde_json::from_str(&data)
+        .map_err(|e| HyperFindError::IndexError(format!("commit parse: {}", e)))?;
     Ok(Some(commit))
 }
 
-/// Deletes all segment files and the commit point.
 pub fn delete_all_segments() -> Result<(), HyperFindError> {
     let segments_dir = paths::segments_dir()?;
     if segments_dir.exists() {
         fs::remove_dir_all(&segments_dir)?;
     }
+
     let commit_path = paths::index_dir()?.join("commit.json");
     if commit_path.exists() {
         fs::remove_file(&commit_path)?;
     }
+
     Ok(())
+}
+
+fn read_u32_at(data: &[u8], offset: usize) -> Result<u32, HyperFindError> {
+    if offset + 4 > data.len() {
+        return Err(HyperFindError::IndexError(format!(
+            "unexpected eof while reading u32 at {}",
+            offset
+        )));
+    }
+
+    Ok(u32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ]))
+}
+
+fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32, HyperFindError> {
+    let v = read_u32_at(data, *pos)?;
+    *pos += 4;
+    Ok(v)
+}
+
+fn read_u64(data: &[u8], pos: &mut usize) -> Result<u64, HyperFindError> {
+    if *pos + 8 > data.len() {
+        return Err(HyperFindError::IndexError(format!(
+            "unexpected eof while reading u64 at {}",
+            *pos
+        )));
+    }
+
+    let v = u64::from_le_bytes([
+        data[*pos],
+        data[*pos + 1],
+        data[*pos + 2],
+        data[*pos + 3],
+        data[*pos + 4],
+        data[*pos + 5],
+        data[*pos + 6],
+        data[*pos + 7],
+    ]);
+    *pos += 8;
+    Ok(v)
+}
+
+fn read_slice<'a>(
+    data: &'a [u8],
+    pos: &mut usize,
+    len: usize,
+) -> Result<&'a [u8], HyperFindError> {
+    if *pos + len > data.len() {
+        return Err(HyperFindError::IndexError(format!(
+            "unexpected eof while reading slice at {} len {}",
+            *pos, len
+        )));
+    }
+
+    let s = &data[*pos..*pos + len];
+    *pos += len;
+    Ok(s)
 }

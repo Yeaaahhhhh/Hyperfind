@@ -10,7 +10,7 @@ hyperfind-index-engine = { path = "../index-engine" }
 tracing = { workspace = true }
 chrono = { workspace = true }
 rayon = { workspace = true }
-
+rustc-hash = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",

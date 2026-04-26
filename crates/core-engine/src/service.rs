@@ -7,17 +7,17 @@ use crate::parser::filters;
 use crate::ranking;
 use crate::search::matcher;
 use crate::search::query;
+use hyperfind_collector::scanner;
+use hyperfind_collector::volumes;
 use hyperfind_common::config;
 use hyperfind_common::errors::HyperFindError;
 use hyperfind_common::models::{
-    AppConfig, IndexStats, IndexedDirectory, SearchResult, VolumeInfo,
+    AppConfig, FileDocument, IndexStats, IndexedDirectory, SearchResult, VolumeInfo,
 };
-use hyperfind_collector::scanner;
-use hyperfind_collector::volumes;
 use hyperfind_index_engine::index_store::IndexStore;
 use hyperfind_index_engine::{loader, writer};
 use parking_lot::RwLock;
-use std::collections::HashSet;
+use rayon::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -38,8 +38,17 @@ impl SearchService {
     }
 
     pub fn search(&self, raw_query: &str) -> Result<Vec<SearchResult>, HyperFindError> {
-        if let Some(cached) = self.cache.get(raw_query) {
-            return Ok(cached);
+        if let Some(ids) = self.cache.get(raw_query) {
+            let docs = self.index_store.get_by_ids(&ids);
+            let results: Vec<SearchResult> = docs
+                .into_iter()
+                .map(|d| SearchResult {
+                    document: (*d).clone(),
+                    score: 1.0,
+                    snippet: None,
+                })
+                .collect();
+            return Ok(results);
         }
 
         let parsed = dsl::parse_query(raw_query)?;
@@ -48,61 +57,65 @@ impl SearchService {
         let keywords = &normalized.keywords;
         let config = self.config.read().clone();
 
-        // Step 1: Bitmap filter (ext/type)
-        let bitmap_candidates = filters::compile_bitmap_filter(
-            &normalized.filters,
-            &self.index_store.bitmap_index,
-        );
+        let bitmap_candidates =
+            filters::compile_bitmap_filter(&normalized.filters, &self.index_store.bitmap_index);
 
-        // Step 2: Trigram candidates (keywords)
-        let trigram_candidates: Option<HashSet<u64>> = if !keywords.is_empty() {
-            let mut combined: Option<HashSet<u64>> = None;
+        let trigram_candidates: Option<roaring::RoaringTreemap> = if !keywords.is_empty() {
+            let mut combined: Option<roaring::RoaringTreemap> = None;
+
             for keyword in keywords {
-                let ids: HashSet<u64> = self.index_store.trigram_index
-                    .query(keyword).into_iter().collect();
+                let rt = self
+                    .index_store
+                    .trigram_index
+                    .query_bitmap(keyword)
+                    .unwrap_or_default();
+
                 combined = Some(match combined {
-                    Some(existing) => existing.intersection(&ids).copied().collect(),
-                    None => ids,
+                    Some(existing) => existing & rt,
+                    None => rt,
                 });
+
+                if combined.as_ref().is_some_and(|x| x.is_empty()) {
+                    break;
+                }
             }
+
             combined
         } else {
             None
         };
 
-        // Step 3: Intersect
-        let candidate_ids: Option<HashSet<u64>> = match (bitmap_candidates, trigram_candidates) {
-            (Some(bm), Some(tri)) => Some(bm.intersection(&tri).copied().collect()),
-            (Some(bm), None) => Some(bm),
-            (None, Some(tri)) => Some(tri),
-            (None, None) => None,
-        };
+        let candidate_ids: Option<roaring::RoaringTreemap> =
+            match (bitmap_candidates, trigram_candidates) {
+                (Some(bm), Some(tri)) => Some(bm & tri),
+                (Some(bm), None) => Some(bm),
+                (None, Some(tri)) => Some(tri),
+                (None, None) => None,
+            };
 
-        // Step 4: Post-filter
         let post_filter = filters::compile_post_filter(&normalized.filters);
 
-        // Step 5: Get candidates and score
-        let candidates = if let Some(ref ids) = candidate_ids {
-            let id_vec: Vec<u64> = ids.iter().copied().collect();
+        let candidates: Vec<Arc<FileDocument>> = if let Some(ref ids) = candidate_ids {
+            let id_vec: Vec<u64> = ids.iter().collect();
             self.index_store.get_by_ids(&id_vec)
         } else {
-            self.index_store.all_documents()
+            self.index_store.all_documents_arc()
         };
 
         let mut results: Vec<SearchResult> = candidates
-            .into_iter()
-            .filter(|doc| post_filter(doc))
+            .into_par_iter()
+            .filter(|doc| post_filter(doc.as_ref()))
             .filter_map(|doc| {
-                let match_result = matcher::match_document(&doc, keywords);
+                let match_result = matcher::match_document(doc.as_ref(), keywords);
                 if match_result.matched || keywords.is_empty() {
                     let snippet = if normalized.search_content && !keywords.is_empty() {
-                        search_content(&doc.path, keywords, &config)
+                        search_content(doc.path.as_ref(), keywords, &config)
                     } else {
                         None
                     };
                     Some(SearchResult {
                         score: match_result.score,
-                        document: doc,
+                        document: (*doc).clone(),
                         snippet,
                     })
                 } else {
@@ -114,33 +127,33 @@ impl SearchService {
         ranking::rank_results(&mut results, &normalized.sort_by, &normalized.sort_order);
         results.truncate(limit);
 
-        self.cache.put(raw_query.to_string(), results.clone());
+        let cached_ids: Vec<u64> = results.iter().map(|r| r.document.id).collect();
+        self.cache.put(raw_query.to_string(), cached_ids);
+
         info!("Search '{}' returned {} results", raw_query, results.len());
         Ok(results)
     }
 
-    /// One-click full system index: uses MFT on Windows, walkdir on other platforms.
     pub fn index_all_volumes(&self) -> Result<IndexStats, HyperFindError> {
         let config = self.config.read().clone();
-
         info!("Starting full system index...");
         let start = std::time::Instant::now();
 
-        // Use the scanner's smart all-drive scan (MFT on Windows, walkdir fallback)
         let documents = scanner::scan_all_drives(&config.excluded_patterns)?;
+        info!(
+            "Scan phase: {} documents in {:.2}s",
+            documents.len(),
+            start.elapsed().as_secs_f64()
+        );
 
-        info!("Scan phase: {} documents in {:.2}s",
-            documents.len(), start.elapsed().as_secs_f64());
-
-        // Load into store (builds trigram + bitmap indexes)
         let idx_start = std::time::Instant::now();
-        self.index_store.load(documents.clone());
+        self.index_store.load(documents);
         info!("Index build phase: {:.2}s", idx_start.elapsed().as_secs_f64());
 
-        // Persist to disk
         let write_start = std::time::Instant::now();
+        let docs_for_disk = self.index_store.all_documents();
         writer::write_index(
-            &documents,
+            &docs_for_disk,
             &self.index_store.trigram_index,
             &self.index_store.bitmap_index,
         )?;
@@ -148,25 +161,34 @@ impl SearchService {
 
         self.cache.clear();
 
-        // Update config with discovered volumes
         let vols = volumes::discover_volumes();
         let mut cfg = self.config.write();
-        cfg.directories = vols.iter()
-            .map(|v| IndexedDirectory { path: v.mount_point.clone(), enabled: true })
+        cfg.directories = vols
+            .iter()
+            .map(|v| IndexedDirectory {
+                path: v.mount_point.clone(),
+                enabled: true,
+            })
             .collect();
         let cfg_clone = cfg.clone();
         drop(cfg);
         let _ = config::save_config(&cfg_clone);
 
         let total_time = start.elapsed().as_secs_f64();
-        info!("Full system index complete: {} documents in {:.2}s", documents.len(), total_time);
+        info!(
+            "Full system index complete: {} documents in {:.2}s",
+            docs_for_disk.len(),
+            total_time
+        );
 
         Ok(self.compute_stats())
     }
 
     pub fn rebuild_index(&self) -> Result<IndexStats, HyperFindError> {
         let config = self.config.read().clone();
-        let enabled_dirs: Vec<String> = config.directories.iter()
+        let enabled_dirs: Vec<String> = config
+            .directories
+            .iter()
             .filter(|d| d.enabled)
             .map(|d| d.path.clone())
             .collect();
@@ -177,12 +199,15 @@ impl SearchService {
         }
 
         let documents = scanner::scan_directories(&enabled_dirs, &config.excluded_patterns)?;
-        self.index_store.load(documents.clone());
+        self.index_store.load(documents);
+
+        let docs_for_disk = self.index_store.all_documents();
         writer::write_index(
-            &documents,
+            &docs_for_disk,
             &self.index_store.trigram_index,
             &self.index_store.bitmap_index,
         )?;
+
         self.cache.clear();
         Ok(self.compute_stats())
     }
@@ -191,15 +216,18 @@ impl SearchService {
         let config = self.config.read().clone();
         let documents = scanner::scan_directory(path, &config.excluded_patterns)?;
         let count = documents.len();
+
         for doc in documents {
             self.index_store.upsert(doc);
         }
+
         let all = self.index_store.all_documents();
         writer::write_index(
             &all,
             &self.index_store.trigram_index,
             &self.index_store.bitmap_index,
         )?;
+
         self.cache.clear();
         Ok(count)
     }
@@ -208,15 +236,43 @@ impl SearchService {
         if !writer::index_exists()? {
             return Ok(self.compute_stats());
         }
+
+        let t0 = std::time::Instant::now();
+
         let (documents, trigram_data, bitmap_data) = loader::load_index()?;
-        self.index_store.load(documents);
-        if !trigram_data.is_empty() {
-            self.index_store.trigram_index.deserialize(&trigram_data);
-        }
-        if !bitmap_data.is_empty() {
-            self.index_store.bitmap_index.deserialize(&bitmap_data);
-        }
+        info!(
+            "loader::load_index done in {:.2}s, {} docs",
+            t0.elapsed().as_secs_f64(),
+            documents.len()
+        );
+
+        let trigram_index = &self.index_store.trigram_index;
+        let bitmap_index = &self.index_store.bitmap_index;
+        let store = &self.index_store;
+
+        let t1 = std::time::Instant::now();
+        rayon::scope(|s| {
+            s.spawn(|_| {
+                if !trigram_data.is_empty() {
+                    trigram_index.deserialize(&trigram_data);
+                }
+            });
+            s.spawn(|_| {
+                if !bitmap_data.is_empty() {
+                    bitmap_index.deserialize(&bitmap_data);
+                }
+            });
+            s.spawn(|_| {
+                store.load_without_rebuild(documents);
+            });
+        });
+        info!(
+            "Parallel deserialize + load done in {:.2}s",
+            t1.elapsed().as_secs_f64()
+        );
+
         self.cache.clear();
+        info!("Total load_index: {:.2}s", t0.elapsed().as_secs_f64());
         Ok(self.compute_stats())
     }
 
@@ -230,9 +286,13 @@ impl SearchService {
         Ok(())
     }
 
-    pub fn get_stats(&self) -> IndexStats { self.compute_stats() }
+    pub fn get_stats(&self) -> IndexStats {
+        self.compute_stats()
+    }
 
-    pub fn get_config(&self) -> AppConfig { self.config.read().clone() }
+    pub fn get_config(&self) -> AppConfig {
+        self.config.read().clone()
+    }
 
     pub fn update_config(&self, new_config: AppConfig) -> Result<(), HyperFindError> {
         config::save_config(&new_config)?;
@@ -244,9 +304,15 @@ impl SearchService {
         config::validate_directory(path)?;
         let mut cfg = self.config.write();
         if cfg.directories.iter().any(|d| d.path == path) {
-            return Err(HyperFindError::ConfigError(format!("Already configured: {}", path)));
+            return Err(HyperFindError::ConfigError(format!(
+                "Already configured: {}",
+                path
+            )));
         }
-        cfg.directories.push(IndexedDirectory { path: path.to_string(), enabled: true });
+        cfg.directories.push(IndexedDirectory {
+            path: path.to_string(),
+            enabled: true,
+        });
         let cfg_clone = cfg.clone();
         drop(cfg);
         config::save_config(&cfg_clone)?;
@@ -262,12 +328,16 @@ impl SearchService {
         Ok(())
     }
 
-    pub fn discover_volumes(&self) -> Vec<VolumeInfo> { volumes::discover_volumes() }
+    pub fn discover_volumes(&self) -> Vec<VolumeInfo> {
+        volumes::discover_volumes()
+    }
 
-    pub fn index_store(&self) -> &Arc<IndexStore> { &self.index_store }
+    pub fn index_store(&self) -> &Arc<IndexStore> {
+        &self.index_store
+    }
 
     fn compute_stats(&self) -> IndexStats {
-        let docs = self.index_store.all_documents();
+        let docs = self.index_store.all_documents_arc();
         let config = self.config.read();
         let total_files = docs.iter().filter(|d| !d.is_dir).count() as u64;
         let total_dirs = docs.iter().filter(|d| d.is_dir).count() as u64;
@@ -290,13 +360,19 @@ impl SearchService {
 }
 
 fn search_content(path: &str, keywords: &[String], config: &AppConfig) -> Option<String> {
-    if !config.index_content { return None; }
+    if !config.index_content {
+        return None;
+    }
+
     let p = Path::new(path);
-    let content = extractor::extract_content(p, config.content_max_size, &config.content_extensions)?;
+    let content =
+        extractor::extract_content(p, config.content_max_size, &config.content_extensions)?;
+
     for kw in keywords {
         if let Some(snippet) = extractor::generate_snippet(&content, kw, 60) {
             return Some(snippet);
         }
     }
+
     None
 }

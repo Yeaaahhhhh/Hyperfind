@@ -2,59 +2,66 @@
 
 use hyperfind_common::models::{EntryType, FileDocument, SearchFilters};
 use hyperfind_index_engine::bitmap::BitmapIndex;
-use std::collections::HashSet;
+use roaring::RoaringTreemap;
 
-/// Compiles filters into a candidate set using bitmap indexes where possible.
-/// Returns None if no bitmap filtering can be applied (fall back to linear).
+/// 直接返回 Roaring（位图运算 SIMD 友好），避免 HashSet 克隆。
 pub fn compile_bitmap_filter(
     filters: &SearchFilters,
     bitmap: &BitmapIndex,
-) -> Option<HashSet<u64>> {
-    let mut sets: Vec<HashSet<u64>> = Vec::new();
+) -> Option<RoaringTreemap> {
+    let mut acc: Option<RoaringTreemap> = None;
 
     // Extension filter
     if let Some(ref ext) = filters.extension {
-        if let Some(ext_set) = bitmap.get_by_extension(ext) {
-            sets.push(ext_set);
+        if let Some(ext_arc) = bitmap.get_by_extension_arc(ext) {
+            // 第一个集合直接 clone 一次（不可避免）
+            acc = Some(match acc {
+                Some(existing) => existing & &*ext_arc,
+                None => (*ext_arc).clone(),
+            });
         } else {
-            // Extension not found = no results
-            return Some(HashSet::new());
+            return Some(RoaringTreemap::new()); // 没该扩展名 → 空集
         }
     }
 
-    // Entry type filter
     if let Some(ref et) = filters.entry_type {
-        match et {
-            EntryType::File => sets.push(bitmap.get_files()),
-            EntryType::Directory => sets.push(bitmap.get_dirs()),
-        }
+        let arc = match et {
+            EntryType::File => bitmap.get_files_arc(),
+            EntryType::Directory => bitmap.get_dirs_arc(),
+        };
+        acc = Some(match acc {
+            Some(existing) => existing & &*arc,
+            None => (*arc).clone(),
+        });
     }
 
-    if sets.is_empty() {
-        return None; // No bitmap filters applicable
-    }
-
-    // Intersect all sets
-    let mut result = sets.remove(0);
-    for set in sets {
-        result = result.intersection(&set).copied().collect();
-    }
-
-    Some(result)
+    acc
 }
 
-/// Compiles remaining (non-bitmap) filters into a closure.
-pub fn compile_post_filter(filters: &SearchFilters) -> Box<dyn Fn(&FileDocument) -> bool + Send + Sync> {
-    let path_contains = filters.path_contains.clone();
+/// post-filter：把 path_contains 提前小写化，避免每条 doc 都 to_lowercase。
+pub fn compile_post_filter(
+    filters: &SearchFilters,
+) -> Box<dyn Fn(&FileDocument) -> bool + Send + Sync> {
+    // 预编译关键值
+    let path_contains_lower: Option<String> =
+        filters.path_contains.as_ref().map(|p| p.to_lowercase());
     let size_min = filters.size_min;
     let size_max = filters.size_max;
     let modified_after = filters.modified_after;
     let modified_before = filters.modified_before;
 
     Box::new(move |doc: &FileDocument| -> bool {
-        if let Some(ref p) = path_contains {
-            if !doc.path.to_lowercase().contains(&p.to_lowercase()) {
-                return false;
+        if let Some(ref needle) = path_contains_lower {
+            // 大多数路径是 ASCII，按 ASCII 比较即可避免完整 to_lowercase 分配
+            let path: &str = doc.path.as_ref();
+            if path.is_ascii() {
+                if !ascii_contains_ignore_case(path, needle) {
+                    return false;
+                }
+            } else {
+                if !path.to_lowercase().contains(needle) {
+                    return false;
+                }
             }
         }
         if let Some(min) = size_min {
@@ -71,4 +78,23 @@ pub fn compile_post_filter(filters: &SearchFilters) -> Box<dyn Fn(&FileDocument)
         }
         true
     })
+}
+
+/// ASCII 不区分大小写的 contains（needle 必须已是小写）。
+/// 比 `haystack.to_lowercase().contains(needle)` 快很多——零分配。
+fn ascii_contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle_lower.as_bytes();
+    if n.is_empty() { return true; }
+    if n.len() > h.len() { return false; }
+    let limit = h.len() - n.len();
+    'outer: for i in 0..=limit {
+        for j in 0..n.len() {
+            let mut hb = h[i + j];
+            if hb >= b'A' && hb <= b'Z' { hb += 32; }
+            if hb != n[j] { continue 'outer; }
+        }
+        return true;
+    }
+    false
 }

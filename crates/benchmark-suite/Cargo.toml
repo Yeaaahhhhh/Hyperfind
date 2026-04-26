@@ -10,6 +10,7 @@ hyperfind-core-engine = { path = "../core-engine" }
 hyperfind-index-engine = { path = "../index-engine" }
 criterion = { version = "0.5", features = ["html_reports"] }
 chrono = { workspace = true }
+# rustc-hash = { workspace = true }
 
 [[bench]]
 name = "basic_search"

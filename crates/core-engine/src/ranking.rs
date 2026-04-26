@@ -1,7 +1,8 @@
 // File: crates/core-engine/src/ranking.rs
 
-use hyperfind_common::models::{SearchResult, SortField, SortOrder};
 use chrono::Utc;
+use hyperfind_common::models::{SearchResult, SortField, SortOrder};
+use hyperfind_common::utils::ascii_cmp_ignore_case;
 
 pub fn rank_results(
     results: &mut Vec<SearchResult>,
@@ -22,13 +23,26 @@ pub fn rank_results(
 
     match sort_by {
         SortField::Relevance => {
-            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            results.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
         SortField::Name => {
-            results.sort_by(|a, b| a.document.name_lower.cmp(&b.document.name_lower));
+            results.sort_by(|a, b| {
+                let an = a.document.name.as_ref();
+                let bn = b.document.name.as_ref();
+
+                if an.is_ascii() && bn.is_ascii() {
+                    ascii_cmp_ignore_case(an, bn)
+                } else {
+                    an.to_lowercase().cmp(&bn.to_lowercase())
+                }
+            });
         }
         SortField::Path => {
-            results.sort_by(|a, b| a.document.path.cmp(&b.document.path));
+            results.sort_by(|a, b| a.document.path.as_ref().cmp(b.document.path.as_ref()));
         }
         SortField::Size => {
             results.sort_by(|a, b| a.document.size.cmp(&b.document.size));

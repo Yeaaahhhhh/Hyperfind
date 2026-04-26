@@ -17,3 +17,6 @@ crc32fast = { workspace = true }
 rayon = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
+roaring = { workspace = true }
+rustc-hash = { workspace = true }
+bincode = { workspace = true }

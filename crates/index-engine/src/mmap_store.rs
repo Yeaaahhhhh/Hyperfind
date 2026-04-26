@@ -1,11 +1,5 @@
 // File: crates/index-engine/src/mmap_store.rs
 
-//! Memory-mapped segment reader for zero-copy index loading.
-//!
-//! Instead of reading the entire index into heap memory, we mmap the segment files.
-//! The OS page cache handles caching; only accessed pages are loaded into RAM.
-//! This dramatically reduces startup time and memory usage for large indexes.
-
 use hyperfind_common::errors::HyperFindError;
 use memmap2::Mmap;
 use std::fs::File;
@@ -20,16 +14,26 @@ pub struct MmapSegment {
 }
 
 impl MmapSegment {
-    /// Opens and memory-maps a segment file.
+    /// 打开并 mmap 一个 segment 文件。
+    /// 优化：用 `MmapOptions::populate()` 提前把页表读入，避免后续随机访问触发缺页中断。
     pub fn open(path: &Path) -> Result<Self, HyperFindError> {
         let file = File::open(path)?;
         let mmap = unsafe {
-            Mmap::map(&file).map_err(|e| {
-                HyperFindError::IndexError(format!("Failed to mmap segment {:?}: {}", path, e))
-            })?
+            memmap2::MmapOptions::new()
+                .populate()       // 预读：内核会预先把整个文件页缓存好
+                .map(&file)
+                .map_err(|e| {
+                    HyperFindError::IndexError(format!("mmap segment {:?}: {}", path, e))
+                })?
         };
 
-        info!("Mmap segment opened: {:?} ({} bytes)", path, mmap.len());
+        // 顺序访问 hint：让 OS 优化预读策略
+        #[cfg(unix)]
+        {
+            let _ = mmap.advise(memmap2::Advice::Sequential);
+        }
+
+        info!("Mmap segment opened: {:?} ({} MB)", path, mmap.len() / (1024 * 1024));
 
         Ok(Self {
             _file: file,
@@ -38,18 +42,7 @@ impl MmapSegment {
         })
     }
 
-    /// Returns a reference to the memory-mapped data.
-    pub fn data(&self) -> &[u8] {
-        &self.mmap
-    }
-
-    /// Returns the size of the mapped region.
-    pub fn len(&self) -> usize {
-        self.mmap.len()
-    }
-
-    /// Returns true if the mapped region is empty.
-    pub fn is_empty(&self) -> bool {
-        self.mmap.is_empty()
-    }
+    pub fn data(&self) -> &[u8] { &self.mmap }
+    pub fn len(&self) -> usize { self.mmap.len() }
+    pub fn is_empty(&self) -> bool { self.mmap.is_empty() }
 }

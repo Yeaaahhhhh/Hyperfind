@@ -2,38 +2,45 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Represents a single indexed file or directory entry.
-/// This is stored in binary segment format with trigram postings and bitmap indexes.
+///
+/// 优化点：
+/// - 删除冗余 `name_lower`（按需小写化，节省每条 ~40B + 堆分配）
+/// - 删除冗余 `parent`（可由 `path` 派生）
+/// - `name` / `path` / `extension` 改为 `Arc<str>`，跨多处共享避免 clone 时复制堆数据
+/// - `content_hash` 改为 `Option<Arc<str>>`，命中率低时几乎零成本
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileDocument {
     pub id: u64,
-    pub name: String,
-    pub name_lower: String,
-    pub path: String,
-    pub parent: String,
-    pub extension: String,
+    pub name: Arc<str>,
+    pub path: Arc<str>,
+    pub extension: Arc<str>,
     pub size: u64,
     pub modified: DateTime<Utc>,
     pub is_dir: bool,
-    /// Optional content hash for deduplication.
-    pub content_hash: Option<String>,
+    pub content_hash: Option<Arc<str>>,
 }
 
-/// Fixed-size binary representation for mmap storage.
-/// Used in segment files for zero-copy access.
-#[derive(Debug, Clone, Copy)]
-#[repr(C, packed)]
-pub struct FileDocumentCompact {
-    pub id: u64,
-    pub size: u64,
-    pub modified_ts: i64,
-    pub is_dir: u8,
-    pub name_offset: u64,
-    pub name_len: u32,
-    pub path_offset: u64,
-    pub path_len: u32,
-    pub ext_id: u16,
+impl FileDocument {
+    /// 兼容旧 API：按需返回 lower-case name。
+    /// 大多数路径下，name 本身就是 ASCII，可走 fast-path。
+    #[inline]
+    pub fn name_lower(&self) -> String {
+        self.name.to_lowercase()
+    }
+
+    /// 从 path 派生 parent，避免占用额外内存。
+    #[inline]
+    pub fn parent(&self) -> &str {
+        let p: &str = &self.path;
+        let sep_pos = p.rfind(|c| c == '\\' || c == '/');
+        match sep_pos {
+            Some(i) => &p[..i],
+            None => "",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,7 +51,6 @@ pub struct SearchQuery {
     pub limit: Option<usize>,
     pub sort_by: SortField,
     pub sort_order: SortOrder,
-    /// Whether to search file contents as well.
     pub search_content: bool,
 }
 
@@ -75,9 +81,7 @@ pub enum SortField {
 }
 
 impl Default for SortField {
-    fn default() -> Self {
-        SortField::Relevance
-    }
+    fn default() -> Self { SortField::Relevance }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,20 +91,17 @@ pub enum SortOrder {
 }
 
 impl Default for SortOrder {
-    fn default() -> Self {
-        SortOrder::Descending
-    }
+    fn default() -> Self { SortOrder::Descending }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub document: FileDocument,
     pub score: f64,
-    /// Content snippet if content search matched.
     pub snippet: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IndexStats {
     pub total_documents: u64,
     pub total_files: u64,
@@ -112,23 +113,6 @@ pub struct IndexStats {
     pub trigram_count: u64,
     pub segment_count: u32,
     pub index_size_bytes: u64,
-}
-
-impl Default for IndexStats {
-    fn default() -> Self {
-        Self {
-            total_documents: 0,
-            total_files: 0,
-            total_directories: 0,
-            total_size_bytes: 0,
-            indexed_roots: Vec::new(),
-            last_scan: None,
-            last_update: None,
-            trigram_count: 0,
-            segment_count: 0,
-            index_size_bytes: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,11 +128,8 @@ pub struct AppConfig {
     pub default_result_limit: usize,
     pub auto_watch: bool,
     pub auto_rebuild: bool,
-    /// Whether to index file contents for text files.
     pub index_content: bool,
-    /// Max file size (bytes) for content indexing.
     pub content_max_size: u64,
-    /// File extensions eligible for content indexing.
     pub content_extensions: Vec<String>,
 }
 
@@ -157,18 +138,18 @@ impl Default for AppConfig {
         Self {
             directories: Vec::new(),
             excluded_patterns: vec![
-                ".git".to_string(),
-                "node_modules".to_string(),
-                "__pycache__".to_string(),
-                ".DS_Store".to_string(),
-                "$Recycle.Bin".to_string(),
-                "System Volume Information".to_string(),
+                ".git".into(),
+                "node_modules".into(),
+                "__pycache__".into(),
+                ".DS_Store".into(),
+                "$Recycle.Bin".into(),
+                "System Volume Information".into(),
             ],
             default_result_limit: 500,
             auto_watch: true,
             auto_rebuild: true,
             index_content: true,
-            content_max_size: 10 * 1024 * 1024, // 10 MB
+            content_max_size: 10 * 1024 * 1024,
             content_extensions: vec![
                 "txt".into(), "md".into(), "rs".into(), "py".into(),
                 "js".into(), "ts".into(), "jsx".into(), "tsx".into(),
@@ -183,7 +164,6 @@ impl Default for AppConfig {
     }
 }
 
-/// Represents a volume/drive discovered on the system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeInfo {
     pub mount_point: String,

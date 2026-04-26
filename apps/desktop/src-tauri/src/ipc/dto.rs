@@ -37,13 +37,16 @@ impl From<SearchResult> for SearchResultDto {
 
 impl From<FileDocument> for FileDocumentDto {
     fn from(d: FileDocument) -> Self {
+        // 先派生需要的衍生字段，避免 d 被部分 move 后再调用方法
+        let name_lower = d.name_lower();
+        let parent = d.parent().to_string();
         Self {
             id: d.id,
-            name: d.name,
-            name_lower: d.name_lower,
-            path: d.path,
-            parent: d.parent,
-            extension: d.extension,
+            name: d.name.to_string(),
+            name_lower,
+            path: d.path.to_string(),
+            parent,
+            extension: d.extension.to_string(),
             size: d.size,
             modified: d.modified.to_rfc3339(),
             is_dir: d.is_dir,

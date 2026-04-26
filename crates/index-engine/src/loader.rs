@@ -8,51 +8,60 @@ use hyperfind_common::paths;
 use std::fs;
 use tracing::info;
 
-/// Loads the index from segment files.
-/// Returns (documents, trigram_data, bitmap_data).
 pub fn load_index() -> Result<(Vec<FileDocument>, Vec<u8>, Vec<u8>), HyperFindError> {
     let index_dir = paths::index_dir()?;
     let meta_path = index_dir.join("meta.json");
-
     if !meta_path.exists() {
         return Err(HyperFindError::IndexError(
-            "Index metadata not found. Please build the index first.".to_string(),
+            "Index metadata not found.".into(),
         ));
     }
 
-    // Load metadata
-    let meta_content = fs::read_to_string(&meta_path)?;
-    let meta: IndexMeta = serde_json::from_str(&meta_content).map_err(|e| {
-        HyperFindError::SerializationError(format!("Failed to parse meta: {}", e))
-    })?;
+    let meta: IndexMeta = serde_json::from_str(&fs::read_to_string(&meta_path)?)
+        .map_err(|e| HyperFindError::SerializationError(format!("meta parse: {}", e)))?;
 
-    info!("Loading index: version={}, expected_docs={}", meta.version, meta.doc_count);
+    info!(
+        "Loading index: version={}, expected_docs={}",
+        meta.version, meta.doc_count
+    );
+
     document::reset_id_counter(meta.next_id);
 
-    // Load commit point
-    let commit = segment::read_commit()?.ok_or_else(|| {
-        HyperFindError::IndexError("Commit point not found".to_string())
-    })?;
+    let commit = segment::read_commit()?
+        .ok_or_else(|| HyperFindError::IndexError("commit not found".into()))?;
 
     let segments_dir = paths::segments_dir()?;
-    let mut all_docs = Vec::new();
-    let mut all_trigram_data = Vec::new();
-    let mut all_bitmap_data = Vec::new();
+    let mut all_docs: Vec<FileDocument> = Vec::with_capacity(meta.doc_count as usize);
 
-    for seg_id in &commit.segments {
+    let mut all_tri = Vec::new();
+    let mut all_bmp = Vec::new();
+
+    for (i, seg_id) in commit.segments.iter().enumerate() {
         let seg_path = segments_dir.join(format!("{}.seg", seg_id));
         if !seg_path.exists() {
             tracing::warn!("Segment file missing: {}", seg_id);
             continue;
         }
 
-        let (docs, tri_data, bmp_data) = segment::read_segment(&seg_path)?;
+        let (docs, tri, bmp) = segment::read_segment(&seg_path)?;
         all_docs.extend(docs);
-        // For single-segment MVP, we just use the last segment's indexes
-        all_trigram_data = tri_data;
-        all_bitmap_data = bmp_data;
+
+        if i == 0 {
+            all_tri = tri;
+            all_bmp = bmp;
+        } else {
+            tracing::warn!(
+                "Multiple segments found ({} total); current loader only uses trigram/bitmap from first segment",
+                commit.segments.len()
+            );
+        }
     }
 
-    info!("Index loaded: {} documents from {} segments", all_docs.len(), commit.segments.len());
-    Ok((all_docs, all_trigram_data, all_bitmap_data))
+    info!(
+        "Index loaded: {} docs from {} segments",
+        all_docs.len(),
+        commit.segments.len()
+    );
+
+    Ok((all_docs, all_tri, all_bmp))
 }

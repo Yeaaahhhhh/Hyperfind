@@ -1,53 +1,90 @@
 // File: crates/core-engine/src/cache.rs
 
-use hyperfind_common::models::SearchResult;
+//! 查询缓存（优化版）。
+//!
+//! 改动：
+//! - 单 Mutex，减少双锁开销
+//! - 严格 LRU 风格更新顺序
+//! - 避免 `order` 中出现重复 query
+
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+use std::collections::VecDeque;
+
+struct CacheState {
+    entries: FxHashMap<String, Vec<u64>>,
+    order: VecDeque<String>,
+}
 
 pub struct QueryCache {
-    entries: Mutex<HashMap<String, Vec<SearchResult>>>,
+    state: Mutex<CacheState>,
     max_entries: usize,
-    order: Mutex<Vec<String>>,
 }
 
 impl QueryCache {
     pub fn new(max_entries: usize) -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            state: Mutex::new(CacheState {
+                entries: FxHashMap::default(),
+                order: VecDeque::new(),
+            }),
             max_entries,
-            order: Mutex::new(Vec::new()),
         }
     }
 
-    pub fn get(&self, query: &str) -> Option<Vec<SearchResult>> {
-        self.entries.lock().get(query).cloned()
+    pub fn get(&self, query: &str) -> Option<Vec<u64>> {
+        let mut state = self.state.lock();
+        let ids = state.entries.get(query).cloned()?;
+
+        if let Some(pos) = state.order.iter().position(|q| q == query) {
+            state.order.remove(pos);
+        }
+        state.order.push_back(query.to_string());
+
+        Some(ids)
     }
 
-    pub fn put(&self, query: String, results: Vec<SearchResult>) {
-        let mut entries = self.entries.lock();
-        let mut order = self.order.lock();
-        while entries.len() >= self.max_entries && !order.is_empty() {
-            let oldest = order.remove(0);
-            entries.remove(&oldest);
+    pub fn put(&self, query: String, ids: Vec<u64>) {
+        let mut state = self.state.lock();
+
+        if state.entries.contains_key(&query) {
+            state.entries.insert(query.clone(), ids);
+            if let Some(pos) = state.order.iter().position(|q| q == &query) {
+                state.order.remove(pos);
+            }
+            state.order.push_back(query);
+            return;
         }
-        entries.insert(query.clone(), results);
-        order.push(query);
+
+        while state.entries.len() >= self.max_entries {
+            if let Some(oldest) = state.order.pop_front() {
+                state.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+
+        state.entries.insert(query.clone(), ids);
+        state.order.push_back(query);
     }
 
     pub fn clear(&self) {
-        self.entries.lock().clear();
-        self.order.lock().clear();
+        let mut state = self.state.lock();
+        state.entries.clear();
+        state.order.clear();
     }
 
     pub fn len(&self) -> usize {
-        self.entries.lock().len()
+        self.state.lock().entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.lock().is_empty()
+        self.state.lock().entries.is_empty()
     }
 }
 
 impl Default for QueryCache {
-    fn default() -> Self { Self::new(128) }
+    fn default() -> Self {
+        Self::new(128)
+    }
 }
