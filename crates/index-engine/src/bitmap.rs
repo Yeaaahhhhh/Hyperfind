@@ -2,10 +2,9 @@
 
 //! Bitmap-based filter indexes (Roaring-backed).
 //!
-//! 保持现有接口，但修正一些细节：
-//! - `remove_document()` 需要同时支持 file / dir 两侧删除
-//! - build / serialize / deserialize 路径保持紧凑
-//! - 继续保留 Arc 读优化
+//! 本轮新增：
+//! - `compact()`：索引构建后主动重建 ext map，移除空集合，收缩容量
+//! - `stats()`：便于观察常驻数据规模
 
 use parking_lot::RwLock;
 use roaring::RoaringTreemap;
@@ -132,6 +131,46 @@ impl BitmapIndex {
         }
     }
 
+    pub fn compact(&self) {
+        {
+            let mut old = self.extension_map.write();
+            let mut new_map =
+                FxHashMap::with_capacity_and_hasher(old.len(), Default::default());
+
+            for (k, v) in old.drain() {
+                if !v.is_empty() {
+                    new_map.insert(k, v);
+                }
+            }
+
+            new_map.shrink_to_fit();
+            *old = new_map;
+        }
+
+        {
+            let files = self.file_set.read().clone();
+            *self.file_set.write() = Arc::new((*files).clone());
+        }
+
+        {
+            let dirs = self.dir_set.read().clone();
+            *self.dir_set.write() = Arc::new((*dirs).clone());
+        }
+
+        let (exts, files, dirs) = self.stats();
+        info!(
+            "BitmapIndex compacted: exts={}, files={}, dirs={}",
+            exts, files, dirs
+        );
+    }
+
+    pub fn stats(&self) -> (usize, u64, u64) {
+        let exts = self.extension_map.read().len();
+        let files = self.file_set.read().len();
+        let dirs = self.dir_set.read().len();
+        (exts, files, dirs)
+    }
+
     pub fn get_by_extension_arc(&self, ext: &str) -> Option<Arc<RoaringTreemap>> {
         self.extension_map
             .read()
@@ -252,11 +291,14 @@ impl BitmapIndex {
             pos += rlen;
 
             if let Ok(rt) = RoaringTreemap::deserialize_from(&mut slice) {
-                ext_map.insert(ext, Arc::new(rt));
+                if !rt.is_empty() {
+                    ext_map.insert(ext, Arc::new(rt));
+                }
             }
         }
 
         if pos + 4 > data.len() {
+            ext_map.shrink_to_fit();
             *self.extension_map.write() = ext_map;
             *self.file_set.write() = Arc::new(RoaringTreemap::new());
             *self.dir_set.write() = Arc::new(RoaringTreemap::new());
@@ -272,6 +314,7 @@ impl BitmapIndex {
         pos += 4;
 
         if pos + flen > data.len() {
+            ext_map.shrink_to_fit();
             *self.extension_map.write() = ext_map;
             *self.file_set.write() = Arc::new(RoaringTreemap::new());
             *self.dir_set.write() = Arc::new(RoaringTreemap::new());
@@ -283,6 +326,7 @@ impl BitmapIndex {
         let files = RoaringTreemap::deserialize_from(&mut fs).unwrap_or_default();
 
         if pos + 4 > data.len() {
+            ext_map.shrink_to_fit();
             *self.extension_map.write() = ext_map;
             *self.file_set.write() = Arc::new(files);
             *self.dir_set.write() = Arc::new(RoaringTreemap::new());
@@ -298,6 +342,7 @@ impl BitmapIndex {
         pos += 4;
 
         if pos + dlen > data.len() {
+            ext_map.shrink_to_fit();
             *self.extension_map.write() = ext_map;
             *self.file_set.write() = Arc::new(files);
             *self.dir_set.write() = Arc::new(RoaringTreemap::new());
@@ -307,6 +352,7 @@ impl BitmapIndex {
         let mut ds = &data[pos..pos + dlen];
         let dirs = RoaringTreemap::deserialize_from(&mut ds).unwrap_or_default();
 
+        ext_map.shrink_to_fit();
         *self.extension_map.write() = ext_map;
         *self.file_set.write() = Arc::new(files);
         *self.dir_set.write() = Arc::new(dirs);

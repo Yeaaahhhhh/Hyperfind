@@ -150,6 +150,8 @@ impl SearchService {
         self.index_store.load(documents);
         info!("Index build phase: {:.2}s", idx_start.elapsed().as_secs_f64());
 
+        self.log_memory_stats("after_build_compact");
+
         let write_start = std::time::Instant::now();
         let docs_for_disk = self.index_store.all_documents();
         writer::write_index(
@@ -160,6 +162,8 @@ impl SearchService {
         info!("Disk write phase: {:.2}s", write_start.elapsed().as_secs_f64());
 
         self.cache.clear();
+        self.index_store.compact();
+        self.log_memory_stats("after_write_compact");
 
         let vols = volumes::discover_volumes();
         let mut cfg = self.config.write();
@@ -200,6 +204,7 @@ impl SearchService {
 
         let documents = scanner::scan_directories(&enabled_dirs, &config.excluded_patterns)?;
         self.index_store.load(documents);
+        self.log_memory_stats("after_build_compact");
 
         let docs_for_disk = self.index_store.all_documents();
         writer::write_index(
@@ -209,6 +214,9 @@ impl SearchService {
         )?;
 
         self.cache.clear();
+        self.index_store.compact();
+        self.log_memory_stats("after_write_compact");
+
         Ok(self.compute_stats())
     }
 
@@ -229,6 +237,9 @@ impl SearchService {
         )?;
 
         self.cache.clear();
+        self.index_store.compact();
+        self.log_memory_stats("after_incremental_write_compact");
+
         Ok(count)
     }
 
@@ -272,6 +283,9 @@ impl SearchService {
         );
 
         self.cache.clear();
+        self.index_store.compact();
+        self.log_memory_stats("after_load_compact");
+
         info!("Total load_index: {:.2}s", t0.elapsed().as_secs_f64());
         Ok(self.compute_stats())
     }
@@ -283,6 +297,8 @@ impl SearchService {
             &self.index_store.trigram_index,
             &self.index_store.bitmap_index,
         )?;
+        self.index_store.compact();
+        self.log_memory_stats("after_save_compact");
         Ok(())
     }
 
@@ -334,6 +350,14 @@ impl SearchService {
 
     pub fn index_store(&self) -> &Arc<IndexStore> {
         &self.index_store
+    }
+
+    fn log_memory_stats(&self, tag: &str) {
+        let (docs, tri, posting_sum, exts, files, dirs) = self.index_store.memory_stats();
+        info!(
+            "Index memory stats [{}]: docs={}, trigrams={}, postings_sum={}, exts={}, files={}, dirs={}",
+            tag, docs, tri, posting_sum, exts, files, dirs
+        );
     }
 
     fn compute_stats(&self) -> IndexStats {

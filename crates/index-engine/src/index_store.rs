@@ -38,7 +38,6 @@ impl IndexStore {
         }
     }
 
-    /// 全量重建：装载文档并并行重建 trigram + bitmap。
     pub fn load(&self, docs: Vec<FileDocument>) {
         let n = docs.len();
         let t0 = std::time::Instant::now();
@@ -59,7 +58,8 @@ impl IndexStore {
             });
         });
 
-        let arc_docs: Vec<Arc<FileDocument>> = docs.into_iter().map(Arc::new).collect();
+        let mut arc_docs: Vec<Arc<FileDocument>> = docs.into_iter().map(Arc::new).collect();
+        arc_docs.shrink_to_fit();
 
         let entries: Vec<(u64, u64, u32)> = arc_docs
             .par_iter()
@@ -75,9 +75,14 @@ impl IndexStore {
             id_idx.insert(id, idx);
         }
 
+        path_idx.shrink_to_fit();
+        id_idx.shrink_to_fit();
+
         *self.documents.write() = arc_docs;
         *self.path_index.write() = path_idx;
         *self.id_index.write() = id_idx;
+
+        self.compact();
 
         info!(
             "IndexStore::load done: {} docs in {:.2}s (parallel build)",
@@ -86,12 +91,12 @@ impl IndexStore {
         );
     }
 
-    /// 从磁盘恢复时只装载文档和 path/id 索引，不重建 trigram / bitmap。
     pub fn load_without_rebuild(&self, docs: Vec<FileDocument>) {
         let n = docs.len();
         let t0 = std::time::Instant::now();
 
-        let arc_docs: Vec<Arc<FileDocument>> = docs.into_iter().map(Arc::new).collect();
+        let mut arc_docs: Vec<Arc<FileDocument>> = docs.into_iter().map(Arc::new).collect();
+        arc_docs.shrink_to_fit();
 
         let entries: Vec<(u64, u64, u32)> = arc_docs
             .par_iter()
@@ -107,15 +112,52 @@ impl IndexStore {
             id_idx.insert(id, idx);
         }
 
+        path_idx.shrink_to_fit();
+        id_idx.shrink_to_fit();
+
         *self.documents.write() = arc_docs;
         *self.path_index.write() = path_idx;
         *self.id_index.write() = id_idx;
+
+        self.compact();
 
         info!(
             "IndexStore::load_without_rebuild done: {} docs in {:.2}s",
             n,
             t0.elapsed().as_secs_f64()
         );
+    }
+
+    pub fn compact(&self) {
+        {
+            let mut docs = self.documents.write();
+            docs.shrink_to_fit();
+        }
+        {
+            let mut path_idx = self.path_index.write();
+            path_idx.shrink_to_fit();
+        }
+        {
+            let mut id_idx = self.id_index.write();
+            id_idx.shrink_to_fit();
+        }
+
+        self.trigram_index.compact();
+        self.bitmap_index.compact();
+
+        let (docs, tri, posting_sum, exts, files, dirs) = self.memory_stats();
+        info!(
+            "IndexStore compacted: docs={}, trigrams={}, postings_sum={}, exts={}, files={}, dirs={}",
+            docs, tri, posting_sum, exts, files, dirs
+        );
+    }
+
+    pub fn memory_stats(&self) -> (usize, u64, u64, usize, u64, u64) {
+        let docs = self.documents.read().len();
+        let tri = self.trigram_index.trigram_count();
+        let posting_sum = self.trigram_index.posting_count_sum();
+        let (exts, files, dirs) = self.bitmap_index.stats();
+        (docs, tri, posting_sum, exts, files, dirs)
     }
 
     pub fn all_documents_arc(&self) -> Vec<Arc<FileDocument>> {

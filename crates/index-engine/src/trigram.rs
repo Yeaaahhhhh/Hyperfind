@@ -5,8 +5,8 @@
 //! 关键改动：
 //! - 提供 `query_bitmap()`，搜索阶段直接返回 `RoaringTreemap`，避免 `Vec<u64> -> RoaringTreemap` 二次构造
 //! - `build()` 改为分片并行局部聚合再 merge，避免 `Vec<(u64, Vec<u32>)>` 这种超大中间结构
-//! - 预分配与合并路径优化，降低 build 峰值内存
-//! - 保留旧 `query()` / `query_into()` 兼容 API，但内部复用位图查询
+//! - 提供 `compact()`，在索引构建完成后主动收缩 map 容量，移除空 posting
+//! - 提供基础统计接口，便于判断常驻内存大头
 
 use hyperfind_common::utils::trigram_codes;
 use parking_lot::RwLock;
@@ -26,10 +26,6 @@ impl TrigramIndex {
         }
     }
 
-    /// 分片并行构建：
-    /// - 每个分片在线程内局部聚合 trigram -> roaring
-    /// - 最后 merge 到全局 map
-    /// 这样比先构造 `Vec<(u64, Vec<u32>)>` 更省内存。
     pub fn build(&self, docs: &[(u64, &str)]) {
         if docs.is_empty() {
             self.postings.write().clear();
@@ -109,7 +105,6 @@ impl TrigramIndex {
         }
     }
 
-    /// 直接返回位图结果，供搜索链路直接做位图交集。
     pub fn query_bitmap(&self, keyword: &str) -> Option<RoaringTreemap> {
         let codes = trigram_codes(keyword);
         if codes.is_empty() {
@@ -139,7 +134,6 @@ impl TrigramIndex {
         Some(acc)
     }
 
-    /// 兼容旧 API。
     pub fn query(&self, keyword: &str) -> Vec<u64> {
         match self.query_bitmap(keyword) {
             Some(rt) => rt.into_iter().collect(),
@@ -147,7 +141,6 @@ impl TrigramIndex {
         }
     }
 
-    /// 兼容旧 API，避免调用方二次分配。
     pub fn query_into(&self, keyword: &str, out: &mut Vec<u64>) {
         out.clear();
         if let Some(rt) = self.query_bitmap(keyword) {
@@ -162,13 +155,43 @@ impl TrigramIndex {
         self.postings.read().len() as u64
     }
 
+    pub fn posting_count_sum(&self) -> u64 {
+        self.postings
+            .read()
+            .values()
+            .map(|rt| rt.len())
+            .sum()
+    }
+
+    pub fn compact(&self) {
+        let mut old = self.postings.write();
+
+        if old.is_empty() {
+            return;
+        }
+
+        let mut new_map = FxHashMap::with_capacity_and_hasher(old.len(), Default::default());
+
+        for (code, rt) in old.drain() {
+            if !rt.is_empty() {
+                new_map.insert(code, rt);
+            }
+        }
+
+        new_map.shrink_to_fit();
+        *old = new_map;
+
+        info!(
+            "TrigramIndex compacted: {} unique trigrams, postings_sum={}",
+            old.len(),
+            old.values().map(|rt| rt.len()).sum::<u64>()
+        );
+    }
+
     pub fn clear(&self) {
         self.postings.write().clear();
     }
 
-    /// 二进制序列化：
-    /// [count: u32]
-    /// 每条: [trigram_code: u32] [roaring_len: u32] [roaring bytes...]
     pub fn serialize(&self) -> Vec<u8> {
         let postings = self.postings.read();
         let mut buf = Vec::with_capacity(postings.len() * 32);
@@ -233,10 +256,13 @@ impl TrigramIndex {
             pos += rlen;
 
             if let Ok(rt) = RoaringTreemap::deserialize_from(&mut slice) {
-                postings.insert(code, rt);
+                if !rt.is_empty() {
+                    postings.insert(code, rt);
+                }
             }
         }
 
+        postings.shrink_to_fit();
         *self.postings.write() = postings;
     }
 }
